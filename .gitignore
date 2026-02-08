@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+.next/
+out/
+
+# Docker volumes
+pgdata/
+redisdata/
+
+# Cloned repos (ingestion temp)
+backend/cloned_repos/
+
+# Alembic
+backend/alembic/versions/__pycache__/
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+.claude
