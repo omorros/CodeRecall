@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy==2.0.36
+alembic==1.14.1
+psycopg2-binary==2.9.10
+pgvector==0.3.6
+openai==1.58.1
+redis==5.2.1
+rq==2.1.0
+tiktoken==0.8.0
+gitpython==3.1.43
+pydantic-settings==2.7.1
