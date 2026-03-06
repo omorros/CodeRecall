@@ -4,12 +4,19 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+import redis
+from rq import Queue
+
 from app.database import get_db
+from app.config import settings
 from app.models import Repo
 from app.schemas import RepoCreate, RepoResponse
-from app.services.ingestion import ingest_repo
 
 router = APIRouter(prefix="/repos", tags=["repos"])
+
+
+def get_queue() -> Queue:
+    return Queue(connection=redis.Redis.from_url(settings.redis_url))
 
 
 def parse_github_url(url: str) -> str:
@@ -47,9 +54,9 @@ def create_repo(body: RepoCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(repo)
 
-    # Run ingestion synchronously for now (Phase 4 moves this to a background worker)
-    ingest_repo(db, repo.id, github_url)
-    db.refresh(repo)
+    # Queue ingestion as a background job — returns immediately
+    q = get_queue()
+    q.enqueue("app.services.ingestion.ingest_repo_job", str(repo.id), github_url)
 
     return repo
 
