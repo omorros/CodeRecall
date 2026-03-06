@@ -199,3 +199,18 @@ def ingest_repo(db: Session, repo_id: uuid.UUID, github_url: str):
         # 5. Always clean up the cloned repo
         if clone_dir and os.path.exists(clone_dir):
             shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+def ingest_repo_job(repo_id_str: str, github_url: str):
+    """Entry point for the RQ worker.
+
+    RQ runs this in a separate process, so it can't use FastAPI's
+    request-scoped DB session. We create our own session here.
+    """
+    from app.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        ingest_repo(db, uuid.UUID(repo_id_str), github_url)
+    finally:
+        db.close()
