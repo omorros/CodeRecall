@@ -1,1 +1,151 @@
-# Vector search + LLM call
+from uuid import UUID
+
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from openai import OpenAI
+
+from app.config import settings
+from app.models import Conversation, Message
+from app.services.embeddings import get_embedding
+
+client = OpenAI(api_key=settings.openai_api_key)
+
+TOP_K = 10
+
+SYSTEM_PROMPT = """You are a helpful code assistant. You answer questions about a GitHub repository based on the code context provided.
+
+Rules:
+- Answer based ONLY on the provided code context
+- If the context doesn't contain enough information, say so
+- Reference specific files when discussing code
+- Use code blocks with the appropriate language for code snippets
+- Be concise and precise"""
+
+
+def search_similar_chunks(db: Session, repo_id: UUID, query_embedding: list[float], top_k: int = TOP_K) -> list[dict]:
+    """Find the top-K most similar chunks using cosine distance.
+
+    The <=> operator is pgvector's cosine distance.
+    We compute similarity as 1 - distance (so higher = more similar).
+    """
+    results = db.execute(
+        text("""
+            SELECT id, file_path, content, chunk_index, token_count,
+                   1 - (embedding <=> CAST(:embedding AS vector)) as similarity
+            FROM chunks
+            WHERE repo_id = CAST(:repo_id AS uuid)
+            ORDER BY embedding <=> CAST(:embedding AS vector)
+            LIMIT :top_k
+        """),
+        {"repo_id": str(repo_id), "embedding": str(query_embedding), "top_k": top_k},
+    ).fetchall()
+
+    return [
+        {
+            "chunk_id": str(row.id),
+            "file_path": row.file_path,
+            "content": row.content,
+            "chunk_index": row.chunk_index,
+            "similarity": round(float(row.similarity), 4),
+        }
+        for row in results
+    ]
+
+
+def build_context(chunks: list[dict]) -> str:
+    """Format retrieved chunks into a readable context block for the LLM."""
+    parts = []
+    for chunk in chunks:
+        parts.append(f"--- File: {chunk['file_path']} (chunk {chunk['chunk_index']}) ---\n{chunk['content']}")
+    return "\n\n".join(parts)
+
+
+def get_conversation_history(db: Session, conversation_id: UUID, limit: int = 10) -> list[dict]:
+    """Load previous messages so the LLM can follow up on earlier questions."""
+    messages = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation_id)
+        .order_by(Message.created_at.asc())
+        .limit(limit)
+        .all()
+    )
+    return [{"role": msg.role, "content": msg.content} for msg in messages]
+
+
+def chat_with_repo(db: Session, repo_id: UUID, user_message: str, conversation_id: UUID | None = None) -> dict:
+    """Full RAG pipeline: embed question → search → build prompt → call LLM → save."""
+
+    # 1. Embed the user's question
+    query_embedding = get_embedding(user_message)
+
+    # 2. Find the most relevant code chunks
+    chunks = search_similar_chunks(db, repo_id, query_embedding)
+
+    # 3. Build the context from retrieved chunks
+    context = build_context(chunks)
+
+    # 4. Get or create a conversation
+    if conversation_id:
+        conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+        if not conversation:
+            conversation = Conversation(repo_id=repo_id)
+            db.add(conversation)
+            db.flush()
+    else:
+        conversation = Conversation(repo_id=repo_id)
+        db.add(conversation)
+        db.flush()
+
+    # 5. Build the messages array for the LLM
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    # Include previous messages if continuing a conversation
+    if conversation_id:
+        history = get_conversation_history(db, conversation.id)
+        messages.extend(history)
+
+    # The user's question with the retrieved code context
+    user_prompt = f"""Here is the relevant code context from the repository:
+
+{context}
+
+User question: {user_message}"""
+
+    messages.append({"role": "user", "content": user_prompt})
+
+    # 6. Call the LLM
+    response = client.chat.completions.create(
+        model=settings.chat_model,
+        messages=messages,
+        temperature=0.1,
+        max_tokens=2000,
+    )
+
+    answer = response.choices[0].message.content
+
+    # 7. Save messages + source references
+    sources = [
+        {"file_path": c["file_path"], "chunk_id": c["chunk_id"], "similarity": c["similarity"]}
+        for c in chunks
+    ]
+
+    user_msg = Message(
+        conversation_id=conversation.id,
+        role="user",
+        content=user_message,
+    )
+    assistant_msg = Message(
+        conversation_id=conversation.id,
+        role="assistant",
+        content=answer,
+        sources=sources,
+    )
+    db.add(user_msg)
+    db.add(assistant_msg)
+    db.commit()
+
+    return {
+        "answer": answer,
+        "sources": sources,
+        "conversation_id": conversation.id,
+    }
