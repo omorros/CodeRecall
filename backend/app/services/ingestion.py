@@ -1,6 +1,7 @@
 import os
 import shutil
 import uuid
+import time
 import tempfile
 from pathlib import Path
 
@@ -24,6 +25,13 @@ MAX_FILE_SIZE = 1_000_000      # skip files larger than 1MB
 CHUNK_TOKEN_LIMIT = 1500       # max tokens per chunk
 CHUNK_OVERLAP_TOKENS = 200     # overlap between consecutive chunks
 EMBEDDING_BATCH_SIZE = 100     # how many chunks to embed per API call
+MAX_EMBEDDING_TOKENS = 8000    # text-embedding-3-small limit is 8191
+
+# Files to skip even if their extension is supported
+SKIP_FILENAMES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock",
+    "Cargo.lock", "Gemfile.lock", "poetry.lock", ".terraform.lock.hcl",
+}
 
 # tiktoken encoder for the model family used by text-embedding-3-small
 encoding = tiktoken.get_encoding("cl100k_base")
@@ -31,7 +39,15 @@ encoding = tiktoken.get_encoding("cl100k_base")
 
 def count_tokens(text: str) -> int:
     """Count how many tokens a string uses."""
-    return len(encoding.encode(text))
+    return len(encoding.encode(text, disallowed_special=()))
+
+
+def truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """Truncate text to fit within a token limit."""
+    tokens = encoding.encode(text, disallowed_special=())
+    if len(tokens) <= max_tokens:
+        return text
+    return encoding.decode(tokens[:max_tokens])
 
 
 def split_into_chunks(content: str) -> list[dict]:
@@ -109,6 +125,8 @@ def walk_files(repo_dir: str) -> list[tuple[str, str]]:
             continue
         if ".git" in file_path.parts:
             continue
+        if file_path.name in SKIP_FILENAMES:
+            continue
         if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             continue
         if file_path.stat().st_size > MAX_FILE_SIZE:
@@ -151,6 +169,7 @@ def ingest_repo(db: Session, repo_id: uuid.UUID, github_url: str):
                 # Prefix with file path — gives the embedding model context
                 # about what file this code belongs to
                 embed_text = f"File: {file_path}\n\n{chunk['content']}"
+                embed_text = truncate_to_tokens(embed_text, MAX_EMBEDDING_TOKENS)
                 all_chunks.append({
                     "file_path": file_path,
                     "content": chunk["content"],
@@ -166,12 +185,41 @@ def ingest_repo(db: Session, repo_id: uuid.UUID, github_url: str):
             return
 
         # 3. Generate embeddings in batches
-        for i in range(0, len(all_chunks), EMBEDDING_BATCH_SIZE):
-            batch = all_chunks[i:i + EMBEDDING_BATCH_SIZE]
+        # OpenAI limit: 300K tokens per request, 8191 per individual text.
+        MAX_BATCH_TOKENS = 250_000
+
+        def embed_batch(batch: list[dict]):
+            """Embed a batch with retry on rate limit."""
             texts = [c["embed_text"] for c in batch]
-            embeddings = get_embeddings_batch(texts)
-            for chunk, embedding in zip(batch, embeddings):
-                chunk["embedding"] = embedding
+            for attempt in range(5):
+                try:
+                    return get_embeddings_batch(texts)
+                except Exception as e:
+                    if "rate_limit" in str(e).lower() or "429" in str(e):
+                        time.sleep(2 ** attempt)
+                    else:
+                        raise
+            return get_embeddings_batch(texts)
+
+        batch: list[dict] = []
+        batch_tokens = 0
+
+        for chunk in all_chunks:
+            chunk_tokens = count_tokens(chunk["embed_text"])
+            if batch and batch_tokens + chunk_tokens > MAX_BATCH_TOKENS:
+                embeddings = embed_batch(batch)
+                for b_chunk, embedding in zip(batch, embeddings):
+                    b_chunk["embedding"] = embedding
+                batch = []
+                batch_tokens = 0
+
+            batch.append(chunk)
+            batch_tokens += chunk_tokens
+
+        if batch:
+            embeddings = embed_batch(batch)
+            for b_chunk, embedding in zip(batch, embeddings):
+                b_chunk["embedding"] = embedding
 
         # 4. Store chunks + embeddings in database
         db_chunks = []
