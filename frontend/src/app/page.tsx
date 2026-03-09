@@ -120,12 +120,22 @@ export default function Home() {
                       ? "✓"
                       : "✕"}
                   </span>
-                  <div className="min-w-0">
+                  <div className="min-w-0 flex-1">
                     <p className="text-sm font-medium truncate">{repo.name}</p>
                     <p className={`text-xs ${statusColor(repo.status)}`}>
-                      {repo.status}
+                      {repo.status === "processing"
+                        ? `processing — ${repo.progress}%`
+                        : repo.status}
                       {repo.error_message && ` — ${repo.error_message}`}
                     </p>
+                    {repo.status === "processing" && (
+                      <div className="mt-1.5 h-1 w-full bg-neutral-800 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-amber-400 rounded-full transition-all duration-500"
+                          style={{ width: `${repo.progress}%` }}
+                        />
+                      </div>
+                    )}
                   </div>
                 </div>
 

@@ -14,6 +14,7 @@ class RepoResponse(BaseModel):
     github_url: str
     name: str
     status: str
+    progress: int
     error_message: str | None
     created_at: datetime
     updated_at: datetime

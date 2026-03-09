@@ -5,6 +5,7 @@ export interface Repo {
   github_url: string;
   name: string;
   status: "pending" | "processing" | "ready" | "failed";
+  progress: number;
   error_message: string | null;
   created_at: string;
   updated_at: string;
