@@ -149,8 +149,29 @@ def walk_files(repo_dir: str) -> list[tuple[str, str]]:
     return files
 
 
+def _embed_with_retry(texts: list[str], batch_num: int) -> list[list[float]]:
+    """Embed a list of texts with retry on rate limit."""
+    batch_tok = sum(count_tokens(t) for t in texts)
+    logger.info("  Batch %d: %d texts, ~%d tokens", batch_num, len(texts), batch_tok)
+    for attempt in range(5):
+        try:
+            return get_embeddings_batch(texts)
+        except Exception as e:
+            if "rate_limit" in str(e).lower() or "429" in str(e):
+                wait = 2 ** attempt
+                logger.warning("  Rate limited, retrying in %ds...", wait)
+                time.sleep(wait)
+            else:
+                raise
+    return get_embeddings_batch(texts)
+
+
 def ingest_repo(db: Session, repo_id: uuid.UUID, github_url: str):
-    """Full ingestion pipeline: clone, chunk, embed, store."""
+    """Full ingestion pipeline: clone, chunk, embed, store.
+
+    Processes files in streaming batches to keep memory usage low.
+    Each batch is embedded and written to DB before moving to the next.
+    """
     repo = db.query(Repo).filter(Repo.id == repo_id).first()
     if not repo:
         return
@@ -158,97 +179,86 @@ def ingest_repo(db: Session, repo_id: uuid.UUID, github_url: str):
     repo.status = "processing"
     db.commit()
 
+    # OpenAI limit: 300K tokens per request, 8191 per individual text.
+    # Use 100K to stay well under the limit.
+    MAX_BATCH_TOKENS = 100_000
+
     clone_dir = None
     try:
         # 1. Clone
         clone_dir = clone_repo(github_url)
 
-        # 2. Walk files and split into chunks
+        # 2. Walk files
         files = walk_files(clone_dir)
-        all_chunks = []
+        if not files:
+            repo.status = "failed"
+            repo.error_message = "No supported files found in repository"
+            db.commit()
+            return
+
+        logger.info("Repo %s: %d files found, chunking and embedding...", repo_id, len(files))
+
+        # 3. Stream: chunk → embed → store in batches
+        batch: list[dict] = []
+        batch_tokens = 0
+        batch_num = 0
+        total_chunks = 0
+
+        def flush_batch():
+            """Embed the current batch and write to DB."""
+            nonlocal batch, batch_tokens, batch_num, total_chunks
+            if not batch:
+                return
+            texts = [c["embed_text"] for c in batch]
+            embeddings = _embed_with_retry(texts, batch_num)
+
+            db_chunks = []
+            for chunk, embedding in zip(batch, embeddings):
+                db_chunks.append(Chunk(
+                    repo_id=repo_id,
+                    file_path=chunk["file_path"],
+                    content=chunk["content"],
+                    chunk_index=chunk["chunk_index"],
+                    token_count=chunk["token_count"],
+                    embedding=embedding,
+                ))
+            db.bulk_save_objects(db_chunks)
+            db.commit()
+
+            total_chunks += len(batch)
+            logger.info("  Stored %d chunks (total: %d)", len(batch), total_chunks)
+            batch = []
+            batch_tokens = 0
+            batch_num += 1
+
         for file_path, content in files:
             chunks = split_into_chunks(content)
             for chunk in chunks:
-                # Prefix with file path — gives the embedding model context
-                # about what file this code belongs to
                 embed_text = f"File: {file_path}\n\n{chunk['content']}"
                 embed_text = truncate_to_tokens(embed_text, MAX_EMBEDDING_TOKENS)
-                all_chunks.append({
+                chunk_tokens = count_tokens(embed_text)
+
+                if batch and batch_tokens + chunk_tokens > MAX_BATCH_TOKENS:
+                    flush_batch()
+
+                batch.append({
                     "file_path": file_path,
                     "content": chunk["content"],
                     "chunk_index": chunk["chunk_index"],
                     "token_count": chunk["token_count"],
                     "embed_text": embed_text,
                 })
+                batch_tokens += chunk_tokens
 
-        if not all_chunks:
+        flush_batch()
+
+        if total_chunks == 0:
             repo.status = "failed"
             repo.error_message = "No supported files found in repository"
             db.commit()
             return
 
-        # 3. Generate embeddings in batches
-        # OpenAI limit: 300K tokens per request, 8191 per individual text.
-        # Use 100K to stay well under the limit (tiktoken count != OpenAI's exact count).
-        MAX_BATCH_TOKENS = 100_000
-
-        logger.info("Repo %s: %d chunks, generating embeddings...", repo_id, len(all_chunks))
-
-        def embed_batch(batch: list[dict], batch_num: int):
-            """Embed a batch with retry on rate limit."""
-            texts = [c["embed_text"] for c in batch]
-            batch_tok = sum(count_tokens(t) for t in texts)
-            logger.info("  Batch %d: %d chunks, ~%d tokens", batch_num, len(batch), batch_tok)
-            for attempt in range(5):
-                try:
-                    return get_embeddings_batch(texts)
-                except Exception as e:
-                    if "rate_limit" in str(e).lower() or "429" in str(e):
-                        wait = 2 ** attempt
-                        logger.warning("  Rate limited, retrying in %ds...", wait)
-                        time.sleep(wait)
-                    else:
-                        raise
-            return get_embeddings_batch(texts)
-
-        batch: list[dict] = []
-        batch_tokens = 0
-        batch_num = 0
-
-        for chunk in all_chunks:
-            chunk_tokens = count_tokens(chunk["embed_text"])
-            if batch and batch_tokens + chunk_tokens > MAX_BATCH_TOKENS:
-                embeddings = embed_batch(batch, batch_num)
-                for b_chunk, embedding in zip(batch, embeddings):
-                    b_chunk["embedding"] = embedding
-                batch = []
-                batch_tokens = 0
-                batch_num += 1
-
-            batch.append(chunk)
-            batch_tokens += chunk_tokens
-
-        if batch:
-            embeddings = embed_batch(batch, batch_num)
-            for b_chunk, embedding in zip(batch, embeddings):
-                b_chunk["embedding"] = embedding
-
-        logger.info("Repo %s: embeddings done, storing in DB...", repo_id)
-
-        # 4. Store chunks + embeddings in database
-        db_chunks = []
-        for chunk in all_chunks:
-            db_chunk = Chunk(
-                repo_id=repo_id,
-                file_path=chunk["file_path"],
-                content=chunk["content"],
-                chunk_index=chunk["chunk_index"],
-                token_count=chunk["token_count"],
-                embedding=chunk["embedding"],
-            )
-            db_chunks.append(db_chunk)
-
-        db.bulk_save_objects(db_chunks)
+        logger.info("Repo %s: done — %d chunks stored.", repo_id, total_chunks)
         repo.status = "ready"
         db.commit()
 
@@ -258,7 +268,7 @@ def ingest_repo(db: Session, repo_id: uuid.UUID, github_url: str):
         db.commit()
 
     finally:
-        # 5. Always clean up the cloned repo
+        # Always clean up the cloned repo
         if clone_dir and os.path.exists(clone_dir):
             shutil.rmtree(clone_dir, ignore_errors=True)
 
