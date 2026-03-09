@@ -2,12 +2,15 @@ import os
 import shutil
 import uuid
 import time
+import logging
 import tempfile
 from pathlib import Path
 
 import tiktoken
 from git import Repo as GitRepo
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from app.models import Repo, Chunk
 from app.services.embeddings import get_embeddings_batch
@@ -186,40 +189,51 @@ def ingest_repo(db: Session, repo_id: uuid.UUID, github_url: str):
 
         # 3. Generate embeddings in batches
         # OpenAI limit: 300K tokens per request, 8191 per individual text.
-        MAX_BATCH_TOKENS = 250_000
+        # Use 100K to stay well under the limit (tiktoken count != OpenAI's exact count).
+        MAX_BATCH_TOKENS = 100_000
 
-        def embed_batch(batch: list[dict]):
+        logger.info("Repo %s: %d chunks, generating embeddings...", repo_id, len(all_chunks))
+
+        def embed_batch(batch: list[dict], batch_num: int):
             """Embed a batch with retry on rate limit."""
             texts = [c["embed_text"] for c in batch]
+            batch_tok = sum(count_tokens(t) for t in texts)
+            logger.info("  Batch %d: %d chunks, ~%d tokens", batch_num, len(batch), batch_tok)
             for attempt in range(5):
                 try:
                     return get_embeddings_batch(texts)
                 except Exception as e:
                     if "rate_limit" in str(e).lower() or "429" in str(e):
-                        time.sleep(2 ** attempt)
+                        wait = 2 ** attempt
+                        logger.warning("  Rate limited, retrying in %ds...", wait)
+                        time.sleep(wait)
                     else:
                         raise
             return get_embeddings_batch(texts)
 
         batch: list[dict] = []
         batch_tokens = 0
+        batch_num = 0
 
         for chunk in all_chunks:
             chunk_tokens = count_tokens(chunk["embed_text"])
             if batch and batch_tokens + chunk_tokens > MAX_BATCH_TOKENS:
-                embeddings = embed_batch(batch)
+                embeddings = embed_batch(batch, batch_num)
                 for b_chunk, embedding in zip(batch, embeddings):
                     b_chunk["embedding"] = embedding
                 batch = []
                 batch_tokens = 0
+                batch_num += 1
 
             batch.append(chunk)
             batch_tokens += chunk_tokens
 
         if batch:
-            embeddings = embed_batch(batch)
+            embeddings = embed_batch(batch, batch_num)
             for b_chunk, embedding in zip(batch, embeddings):
                 b_chunk["embedding"] = embedding
+
+        logger.info("Repo %s: embeddings done, storing in DB...", repo_id)
 
         # 4. Store chunks + embeddings in database
         db_chunks = []
