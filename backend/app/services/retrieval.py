@@ -25,14 +25,44 @@ Rules:
 - Prefer explaining architecture and purpose over listing file contents"""
 
 
+def _get_readme_chunks(db: Session, repo_id: UUID) -> list[dict]:
+    """Fetch all chunks from the root README.md (if it exists)."""
+    results = db.execute(
+        text("""
+            SELECT id, file_path, content, chunk_index, token_count
+            FROM chunks
+            WHERE repo_id = CAST(:repo_id AS uuid)
+              AND file_path = 'README.md'
+            ORDER BY chunk_index
+        """),
+        {"repo_id": str(repo_id)},
+    ).fetchall()
+
+    return [
+        {
+            "chunk_id": str(row.id),
+            "file_path": row.file_path,
+            "content": row.content,
+            "chunk_index": row.chunk_index,
+            "similarity": 1.0,
+        }
+        for row in results
+    ]
+
+
 def search_similar_chunks(db: Session, repo_id: UUID, query_embedding: list[float], top_k: int = TOP_K) -> list[dict]:
     """Find the top-K most similar chunks using cosine distance.
 
-    Uses a diversity strategy: retrieves more candidates, then picks the best
-    chunks while ensuring coverage across different files.
+    Always includes root README.md for context, then fills remaining slots
+    with diverse, semantically similar chunks across different files.
     """
+    # Always include the root README — it's the best overview of any repo
+    readme_chunks = _get_readme_chunks(db, repo_id)
+    readme_ids = {c["chunk_id"] for c in readme_chunks}
+    remaining_slots = max(top_k - len(readme_chunks), 5)
+
     # Fetch extra candidates so we can diversify
-    candidate_k = top_k * 3
+    candidate_k = remaining_slots * 3
 
     results = db.execute(
         text("""
@@ -52,6 +82,9 @@ def search_similar_chunks(db: Session, repo_id: UUID, query_embedding: list[floa
     selected = []
 
     for row in results:
+        # Skip README chunks — they're already included
+        if str(row.id) in readme_ids:
+            continue
         fp = row.file_path
         if file_counts.get(fp, 0) >= MAX_CHUNKS_PER_FILE:
             continue
@@ -63,10 +96,11 @@ def search_similar_chunks(db: Session, repo_id: UUID, query_embedding: list[floa
             "chunk_index": row.chunk_index,
             "similarity": round(float(row.similarity), 4),
         })
-        if len(selected) >= top_k:
+        if len(selected) >= remaining_slots:
             break
 
-    return selected
+    # README first, then similar chunks
+    return readme_chunks + selected
 
 
 def build_context(chunks: list[dict]) -> str:

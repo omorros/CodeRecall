@@ -40,7 +40,13 @@ SKIP_FILENAMES = {
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock",
     "Cargo.lock", "Gemfile.lock", "poetry.lock", ".terraform.lock.hcl",
     ".DS_Store", "thumbs.db",
+    ".gitignore", ".gitattributes", ".editorconfig", ".prettierrc",
+    ".eslintignore", ".dockerignore", ".npmrc", ".nvmrc",
+    "license-policy.toml", ".spellcheck-en.txt",
 }
+
+# Filename prefixes/patterns to skip (matched with startswith/endswith)
+SKIP_FILENAME_PREFIXES = {".pre-commit", ".eslintrc", ".stylelintrc", ".browserslistrc"}
 
 # Directory names to skip entirely
 SKIP_DIRS = {
@@ -52,6 +58,8 @@ SKIP_DIRS = {
     "target",           # Rust / Java build output
     "eggs", "*.egg-info",
     "site-packages",
+    "docs",             # generated docs (README.md at root is still kept)
+    ".github",          # CI/CD workflows
 }
 
 # Path fragments that signal test / fixture files we can skip
@@ -162,6 +170,8 @@ def walk_files(repo_dir: str) -> list[tuple[str, str]]:
             continue
 
         if file_path.name in SKIP_FILENAMES:
+            continue
+        if any(file_path.name.startswith(p) for p in SKIP_FILENAME_PREFIXES):
             continue
         if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             continue
