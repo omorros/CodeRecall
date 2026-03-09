@@ -56,7 +56,7 @@ def create_repo(body: RepoCreate, db: Session = Depends(get_db)):
 
     # Queue ingestion as a background job — returns immediately
     q = get_queue()
-    q.enqueue("app.services.ingestion.ingest_repo_job", str(repo.id), github_url)
+    q.enqueue("app.services.ingestion.ingest_repo_job", str(repo.id), github_url, job_timeout=1800)
 
     return repo
 
