@@ -33,7 +33,7 @@ CHUNK_TOKEN_LIMIT = 1500        # max tokens per chunk
 CHUNK_OVERLAP_TOKENS = 200      # overlap between consecutive chunks
 MAX_EMBEDDING_TOKENS = 8000     # text-embedding-3-small limit is 8 191
 MAX_BATCH_TOKENS = 100_000      # stay well under OpenAI's 300 K/request limit
-CONCURRENT_BATCHES = 5          # how many embedding requests to run in parallel
+CONCURRENT_BATCHES = 3          # how many embedding requests to run in parallel
 
 # Files to always skip (auto-generated / not useful for understanding code)
 SKIP_FILENAMES = {
@@ -203,12 +203,15 @@ def walk_files(repo_dir: str) -> list[tuple[str, str]]:
 
 def _embed_with_retry(texts: list[str]) -> list[list[float]]:
     """Embed a list of texts with exponential-backoff retry on rate limit."""
-    for attempt in range(5):
+    for attempt in range(8):
         try:
             return get_embeddings_batch(texts)
         except Exception as e:
-            if "rate_limit" in str(e).lower() or "429" in str(e):
-                time.sleep(2 ** attempt)
+            err = str(e).lower()
+            if "rate_limit" in err or "429" in str(e):
+                wait = min(2 ** attempt, 30)  # cap at 30s
+                logger.warning("Rate limited, waiting %ds (attempt %d/8)...", wait, attempt + 1)
+                time.sleep(wait)
             else:
                 raise
     return get_embeddings_batch(texts)
